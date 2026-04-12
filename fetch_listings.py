@@ -1,61 +1,97 @@
 #!/usr/bin/env python3
 """
-Fetch freelance job/project listings from multiple free APIs and save as JSON.
-Runs daily via GitHub Actions. Prioritizes FREELANCE PROJECT sources.
+Fetch freelance project listings from multiple free APIs.
+Runs daily via GitHub Actions. Prioritizes FREELANCE/CONTRACT work.
 """
 
 import json
 import requests
 import time
-import xml.etree.ElementTree as ET
+import re
 from datetime import datetime, timezone
 from html import unescape
-import re
 
 
 def strip_html(text):
-    """Remove HTML tags from a string."""
     clean = re.sub(r"<[^>]+>", " ", text or "")
     clean = unescape(clean)
     return re.sub(r"\s+", " ", clean).strip()
 
 
-UPWORK_QUERIES = [
-    "data+engineering", "machine+learning", "python+data",
-    "chatbot", "NLP", "dashboard+analytics", "ETL+pipeline",
-    "AI+automation", "web+scraping+data", "data+analysis",
-    "conversational+AI", "SQL+database",
+FREELANCE_KEYWORDS = [
+    "freelance", "contract", "contractor", "project-based", "part-time",
+    "consultant", "gig", "independent", "short-term", "temporary",
+    "per hour", "hourly", "fixed-price", "milestone", "deliverable",
+    "seeking freelancer", "looking for freelancer", "need a developer",
+    "build a", "create a", "develop a", "implement a", "design a",
 ]
 
-def fetch_upwork_rss():
-    """Fetch real Upwork freelance project postings via RSS feeds."""
+
+def is_likely_freelance(title, description, tags):
+    text = f"{title} {description[:500]} {' '.join(str(t) for t in tags)}".lower()
+    return any(kw in text for kw in FREELANCE_KEYWORDS)
+
+
+# ── HackerNews Freelancer threads (BEST freelance source) ────────────────────
+
+def fetch_hn_freelance():
+    """Fetch from HN 'Freelancer? Seeking Freelancer?' and 'Who is Hiring?' threads."""
     results = []
-    seen_urls = set()
-    for query in UPWORK_QUERIES:
-        url = f"https://www.upwork.com/ab/feed/jobs/rss?q={query}&sort=recency"
+
+    queries = [
+        "Freelancer? Seeking freelancer?",
+        "Who is hiring?",
+    ]
+
+    for query in queries:
         try:
-            resp = requests.get(url, headers={"User-Agent": "PortfolioBuilder/1.0"}, timeout=20)
+            url = f"https://hn.algolia.com/api/v1/search?query={requests.utils.quote(query)}&tags=ask_hn&hitsPerPage=2"
+            resp = requests.get(url, timeout=20)
             resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            for item in root.findall(".//item"):
-                link = item.findtext("link", "")
-                if link in seen_urls:
+            data = resp.json()
+
+            for hit in data.get("hits", []):
+                story_id = hit.get("objectID")
+                if not story_id:
                     continue
-                seen_urls.add(link)
-                title = item.findtext("title", "")
-                desc = strip_html(item.findtext("description", ""))
-                pub_date = item.findtext("pubDate", "")
-                results.append({
-                    "title": title, "company": "Upwork Client",
-                    "description": desc[:2000], "url": link,
-                    "tags": [query.replace("+", " ")],
-                    "source": "Upwork", "date": pub_date,
-                })
+
+                # Fetch comments (each comment is a freelance gig or job post)
+                comments_url = f"https://hn.algolia.com/api/v1/items/{story_id}"
+                cresp = requests.get(comments_url, timeout=30)
+                cresp.raise_for_status()
+                story = cresp.json()
+
+                for child in story.get("children", []):
+                    text = strip_html(child.get("text", ""))
+                    if len(text) < 50:
+                        continue
+
+                    # Extract a title from first line
+                    lines = text.split(".")
+                    title = lines[0][:120] if lines else "HN Freelance Post"
+
+                    is_freelance = is_likely_freelance(title, text, [])
+                    is_seeking = "seeking freelancer" in query.lower()
+
+                    results.append({
+                        "title": title,
+                        "company": child.get("author", "HN User"),
+                        "description": text[:2000],
+                        "url": f"https://news.ycombinator.com/item?id={child.get('id', story_id)}",
+                        "tags": ["freelance" if is_seeking else "hiring", "hackernews"],
+                        "source": "HackerNews",
+                        "date": child.get("created_at", ""),
+                        "listing_type": "freelance" if (is_seeking or is_freelance) else "mixed",
+                    })
+
+                time.sleep(1)
         except Exception as e:
-            print(f"  Upwork RSS ({query}) failed: {e}")
-        time.sleep(0.5)
+            print(f"  HN ({query}) failed: {e}")
+
     return results
 
+
+# ── RemoteOK ─────────────────────────────────────────────────────────────────
 
 def fetch_remoteok():
     try:
@@ -71,15 +107,21 @@ def fetch_remoteok():
         title = item.get("position", "")
         if not title:
             continue
+        tags = item.get("tags", [])
+        desc = strip_html(item.get("description", ""))[:2000]
+        freelance = is_likely_freelance(title, desc, tags)
         results.append({
             "title": title, "company": item.get("company", ""),
-            "description": strip_html(item.get("description", ""))[:2000],
+            "description": desc,
             "url": item.get("url", f"https://remoteok.com/l/{item.get('id', '')}"),
-            "tags": item.get("tags", []), "source": "RemoteOK",
+            "tags": tags, "source": "RemoteOK",
             "date": item.get("date", ""),
+            "listing_type": "freelance" if freelance else "job",
         })
     return results
 
+
+# ── Arbeitnow ────────────────────────────────────────────────────────────────
 
 def fetch_arbeitnow():
     try:
@@ -94,14 +136,20 @@ def fetch_arbeitnow():
         title = item.get("title", "")
         if not title:
             continue
+        tags = item.get("tags", [])
+        desc = strip_html(item.get("description", ""))[:2000]
+        freelance = is_likely_freelance(title, desc, tags)
         results.append({
             "title": title, "company": item.get("company_name", ""),
-            "description": strip_html(item.get("description", ""))[:2000],
-            "url": item.get("url", ""), "tags": item.get("tags", []),
+            "description": desc,
+            "url": item.get("url", ""), "tags": tags,
             "source": "Arbeitnow", "date": item.get("created_at", ""),
+            "listing_type": "freelance" if freelance else "job",
         })
     return results
 
+
+# ── Remotive ─────────────────────────────────────────────────────────────────
 
 def fetch_remotive():
     try:
@@ -117,59 +165,33 @@ def fetch_remotive():
         if not title:
             continue
         tags = [item.get("category", "")]
-        if item.get("job_type"):
-            tags.append(item["job_type"])
+        job_type = item.get("job_type", "")
+        if job_type:
+            tags.append(job_type)
+        desc = strip_html(item.get("description", ""))[:2000]
+        freelance = is_likely_freelance(title, desc, tags) or "contract" in job_type.lower()
         results.append({
             "title": title, "company": item.get("company_name", ""),
-            "description": strip_html(item.get("description", ""))[:2000],
+            "description": desc,
             "url": item.get("url", ""),
             "tags": [t for t in tags if t],
             "source": "Remotive", "date": item.get("publication_date", ""),
+            "listing_type": "freelance" if freelance else "job",
         })
     return results
 
 
-WWR_CATEGORIES = [
-    "remote-programming-jobs",
-    "remote-design-jobs",
-    "remote-devops-sysadmin-jobs",
-]
-
-def fetch_weworkremotely():
-    results = []
-    for category in WWR_CATEGORIES:
-        url = f"https://weworkremotely.com/categories/{category}.json"
-        try:
-            resp = requests.get(url, headers={"User-Agent": "PortfolioBuilder/1.0"}, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            for item in data:
-                title = item.get("title", "")
-                if not title:
-                    continue
-                results.append({
-                    "title": title, "company": item.get("company_name", ""),
-                    "description": strip_html(item.get("description", ""))[:2000],
-                    "url": item.get("url", ""),
-                    "tags": [category.replace("remote-", "").replace("-jobs", "")],
-                    "source": "WeWorkRemotely",
-                    "date": item.get("published_at", ""),
-                })
-        except Exception as e:
-            print(f"  WWR ({category}) failed: {e}")
-        time.sleep(0.5)
-    return results
-
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print(f"Fetching listings at {datetime.now(timezone.utc).isoformat()}")
+
     all_jobs = []
     for name, fetcher in [
-        ("Upwork RSS", fetch_upwork_rss),
+        ("HackerNews Freelance", fetch_hn_freelance),
         ("RemoteOK", fetch_remoteok),
         ("Arbeitnow", fetch_arbeitnow),
         ("Remotive", fetch_remotive),
-        ("WeWorkRemotely", fetch_weworkremotely),
     ]:
         print(f"Fetching from {name}...")
         jobs = fetcher()
@@ -177,6 +199,7 @@ def main():
         all_jobs.extend(jobs)
         time.sleep(1)
 
+    # De-duplicate by URL
     seen = set()
     unique = []
     for job in all_jobs:
@@ -185,7 +208,14 @@ def main():
             seen.add(url)
             unique.append(job)
 
+    # Sort: freelance first, then jobs
+    unique.sort(key=lambda j: (0 if j.get("listing_type") == "freelance" else 1))
+
+    freelance_count = sum(1 for j in unique if j.get("listing_type") == "freelance")
     print(f"\nTotal unique listings: {len(unique)}")
+    print(f"Freelance/contract: {freelance_count}")
+    print(f"Job postings: {len(unique) - freelance_count}")
+
     sources = {}
     for job in unique:
         s = job.get("source", "Unknown")
@@ -196,6 +226,7 @@ def main():
     output = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "count": len(unique),
+        "freelance_count": freelance_count,
         "listings": unique,
     }
     with open("listings.json", "w") as f:
