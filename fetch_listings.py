@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fetch freelance project listings from multiple free APIs.
-Runs daily via GitHub Actions. Prioritizes FREELANCE/CONTRACT work.
+Runs daily via GitHub Actions.
 """
 
 import json
@@ -9,12 +9,15 @@ import requests
 import time
 import re
 from datetime import datetime, timezone
-from html import unescape
 
 
 def strip_html(text):
     clean = re.sub(r"<[^>]+>", " ", text or "")
-    clean = unescape(clean)
+    try:
+        from html import unescape
+        clean = unescape(clean)
+    except Exception:
+        pass
     return re.sub(r"\s+", " ", clean).strip()
 
 
@@ -22,7 +25,7 @@ FREELANCE_KEYWORDS = [
     "freelance", "contract", "contractor", "project-based", "part-time",
     "consultant", "gig", "independent", "short-term", "temporary",
     "per hour", "hourly", "fixed-price", "milestone", "deliverable",
-    "seeking freelancer", "looking for freelancer", "need a developer",
+    "seeking freelancer", "looking for freelancer",
     "build a", "create a", "develop a", "implement a", "design a",
 ]
 
@@ -32,61 +35,93 @@ def is_likely_freelance(title, description, tags):
     return any(kw in text for kw in FREELANCE_KEYWORDS)
 
 
-# ── HackerNews Freelancer threads (BEST freelance source) ────────────────────
+# ── HackerNews — only SEEKING FREELANCER posts from recent threads ───────────
 
 def fetch_hn_freelance():
-    """Fetch from HN 'Freelancer? Seeking Freelancer?' and 'Who is Hiring?' threads."""
+    """Fetch 'SEEKING FREELANCER' posts from recent HN hiring threads."""
     results = []
+    cutoff = int(time.time()) - 60 * 86400  # last 60 days
 
+    # Search for the monthly freelancer threads
     queries = [
-        "Freelancer? Seeking freelancer?",
-        "Who is hiring?",
+        ("Ask HN: Freelancer? Seeking freelancer?", True),
+        ("Ask HN: Who is hiring?", False),
     ]
 
-    for query in queries:
+    for query_text, is_freelancer_thread in queries:
         try:
-            url = f"https://hn.algolia.com/api/v1/search?query={requests.utils.quote(query)}&tags=ask_hn&hitsPerPage=2"
+            url = (
+                "https://hn.algolia.com/api/v1/search?"
+                f"query={requests.utils.quote(query_text)}"
+                f"&tags=story"
+                f"&numericFilters=created_at_i>{cutoff}"
+                f"&hitsPerPage=5"
+            )
             resp = requests.get(url, timeout=20)
             resp.raise_for_status()
-            data = resp.json()
+            hits = resp.json().get("hits", [])
+            print(f"  Found {len(hits)} threads for '{query_text}'")
+        except Exception as e:
+            print(f"  HN search failed for '{query_text}': {e}")
+            continue
 
-            for hit in data.get("hits", []):
-                story_id = hit.get("objectID")
-                if not story_id:
-                    continue
+        for hit in hits:
+            story_id = hit.get("objectID")
+            title = hit.get("title", "")
+            # Only process threads that match
+            title_lower = title.lower()
+            if not ("hiring" in title_lower or "freelancer" in title_lower):
+                continue
 
-                # Fetch comments (each comment is a freelance gig or job post)
-                comments_url = f"https://hn.algolia.com/api/v1/items/{story_id}"
-                cresp = requests.get(comments_url, timeout=30)
+            try:
+                cresp = requests.get(
+                    f"https://hn.algolia.com/api/v1/items/{story_id}",
+                    timeout=30,
+                )
                 cresp.raise_for_status()
                 story = cresp.json()
+            except Exception as e:
+                print(f"  Failed to fetch thread {story_id}: {e}")
+                continue
 
-                for child in story.get("children", []):
-                    text = strip_html(child.get("text", ""))
-                    if len(text) < 50:
+            children = story.get("children", [])
+            print(f"  Thread '{title[:60]}' has {len(children)} comments")
+
+            for child in children:
+                text = strip_html(child.get("text", ""))
+                if len(text) < 50:
+                    continue
+
+                text_upper = text[:300].upper()
+
+                if is_freelancer_thread:
+                    # In freelancer threads: ONLY keep "SEEKING FREELANCER" posts
+                    if "SEEKING FREELANCER" not in text_upper:
+                        continue
+                else:
+                    # In "Who is hiring" threads: keep posts mentioning contract/freelance
+                    text_lower = text[:500].lower()
+                    if not any(kw in text_lower for kw in [
+                        "contract", "freelance", "part-time", "part time",
+                        "consulting", "project-based", "short-term",
+                    ]):
                         continue
 
-                    # Extract a title from first line
-                    lines = text.split(".")
-                    title = lines[0][:120] if lines else "HN Freelance Post"
+                # Extract title from first line
+                first_line = text.split(".")[0][:120] if text else "HN Post"
 
-                    is_freelance = is_likely_freelance(title, text, [])
-                    is_seeking = "seeking freelancer" in query.lower()
+                results.append({
+                    "title": first_line,
+                    "company": child.get("author", "HN User"),
+                    "description": text[:2000],
+                    "url": f"https://news.ycombinator.com/item?id={child.get('id', story_id)}",
+                    "tags": ["freelance", "hackernews"],
+                    "source": "HackerNews",
+                    "date": child.get("created_at", ""),
+                    "listing_type": "freelance",
+                })
 
-                    results.append({
-                        "title": title,
-                        "company": child.get("author", "HN User"),
-                        "description": text[:2000],
-                        "url": f"https://news.ycombinator.com/item?id={child.get('id', story_id)}",
-                        "tags": ["freelance" if is_seeking else "hiring", "hackernews"],
-                        "source": "HackerNews",
-                        "date": child.get("created_at", ""),
-                        "listing_type": "freelance" if (is_seeking or is_freelance) else "mixed",
-                    })
-
-                time.sleep(1)
-        except Exception as e:
-            print(f"  HN ({query}) failed: {e}")
+            time.sleep(1)
 
     return results
 
@@ -208,7 +243,7 @@ def main():
             seen.add(url)
             unique.append(job)
 
-    # Sort: freelance first, then jobs
+    # Sort: freelance first
     unique.sort(key=lambda j: (0 if j.get("listing_type") == "freelance" else 1))
 
     freelance_count = sum(1 for j in unique if j.get("listing_type") == "freelance")
